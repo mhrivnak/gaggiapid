@@ -1,6 +1,4 @@
-// include the library code:
 #include <LiquidCrystal.h>
-#include <dht_nonblocking.h>
 #include "Adafruit_MAX31865.h"
 
 #define DHT_SENSOR_TYPE DHT_TYPE_11
@@ -14,13 +12,10 @@
 const float targetTemp = 95.0;
 
 const byte timer1OutputB = 10;
-// period in milliseconds. 450 gives us 54 zero-crossings at 60hz,
-// aka a granularity of 54 heat levels to set
-const int FREQ = 450;
+// period in milliseconds. 900 gives us 108 zero-crossings at 60hz,
+// aka a granularity of 108 heat levels to set
+const int FREQ = 900;
 const unsigned long countTo = ((float) F_CPU / 1024.0) / (1000.0 / FREQ);
-
-static const int DHT_SENSOR_PIN = 2;
-DHT_nonblocking dht_sensor( DHT_SENSOR_PIN, DHT_SENSOR_TYPE );
 
 // initialize the library with the numbers of the interface pins
 LiquidCrystal lcd(7, 8, 9, 11, 12, 13);
@@ -32,10 +27,14 @@ unsigned long lastCycleTime;
 unsigned long nextCycleTime;
 double lastTemp;
 double errSum;
-const double KP = 1.5;
-const double KI = .3;
-const double KD = 1;
+// .04, .02, .06
+const double KP = 0.06;
+const double KI = 0.003; //0.008;
+const double KDfall = 0.5;
+const double KDrise = 0.1;
 float currentDuty;
+bool brewing;
+unsigned long lastBrewEndTime = 0;
 
 void setup() {
   Serial.begin(9600);
@@ -92,7 +91,7 @@ void loop() {
 
   unsigned long now = millis();
   if (now >= nextCycleTime) {
-    currentDuty = duty(temp);
+    currentDuty = duty(temp, now);
     float limit = countTo * currentDuty - 1;
     if (limit < 0) limit = 0;
     OCR1B = limit;
@@ -110,28 +109,47 @@ void loop() {
   lcd.print(currentDuty);
 }
 
-float duty(float currentTemp) {
-  // if we're not yet within 5 degrees of the target temp, stay full power
-  if (currentTemp < targetTemp - 5) {
+float duty(float currentTemp, long now) {
+  // if we're not yet within 35 degrees of the target temp, stay full power
+  if (currentTemp < targetTemp - 35) {
     lastTemp = currentTemp;
     return 1.0;
   }
 
   double err = targetTemp - currentTemp;
-  double dTemp = currentTemp - lastTemp;
+  double dTemp = lastTemp - currentTemp;
 
-  lastTemp = currentTemp;
+  // if temp is increasing quickly
+  if (dTemp < -1.8 && brewing) {
+    lastBrewEndTime = now;
+    brewing = false;
+  }
+
   float pTerm = KP * err;
   float iTerm = KI * errSum;
+  float kd = (dTemp > .25 && currentTemp < targetTemp) ? KDfall : KDrise;
   // reduce jitter by ignoring small corrections
-  float dTerm = (abs(dTemp) < .25) ? 0 : KD * (err - dTemp);
+  float dTerm = (abs(dTemp) < .15) ? 0 : kd * dTemp;
 
   // don't include this cycle's error in "I" until next cycle
   errSum += err;
+  if (errSum > 30) errSum = 30;
+  if (errSum < -5) errSum = -5;
 
   float duty = pTerm + iTerm + dTerm;
+  if (brewing && (currentTemp < targetTemp + 2)) duty = (dTemp > 0) ? 1.0 : .9;
+  // keep at least a little power in to soften the descent.
+  if ((currentTemp > targetTemp) && (dTemp > 0)) duty = max(duty, min(-.015*err, .05));
   if (duty < 0) duty = 0;
   if (duty > 1) duty = 1;
+
+  // if temp is falling quickly and it's been at least 90s since the last
+  // brew cycle ended...
+  // waiting 90s helps us tolerate wide oscillation just after brewing stops.
+  if ((currentTemp < targetTemp) && (dTemp > .35) && (lastBrewEndTime == 0 || now > lastBrewEndTime + 90000)) {
+    brewing = true;
+    duty = 1.0;
+  }
 
   printCSV(lastTemp);
   printCSV(currentTemp);
@@ -139,6 +157,8 @@ float duty(float currentTemp) {
   printCSV(iTerm);
   printCSV(dTerm);
   Serial.println(duty);
+
+  lastTemp = currentTemp;
 
   return duty;
 }
