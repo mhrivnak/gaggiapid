@@ -33,8 +33,15 @@ const double KI = 0.003; //0.008;
 const double KDfall = 0.5;
 const double KDrise = 0.1;
 float currentDuty;
-bool brewing;
-unsigned long lastBrewEndTime = 0;
+unsigned long stateBegan = 0;
+
+enum state {
+  maintain,
+  brewStarted,
+  brewMain,
+  brewRecovery
+};
+state currentState = maintain;
 
 void setup() {
   Serial.begin(9600);
@@ -107,6 +114,8 @@ void loop() {
   lcd.setCursor(0, 1);
   lcd.print("D: ");
   lcd.print(currentDuty);
+  lcd.print("  S: ");
+  lcd.print(currentState);
 }
 
 float duty(float currentTemp, long now) {
@@ -119,10 +128,32 @@ float duty(float currentTemp, long now) {
   double err = targetTemp - currentTemp;
   double dTemp = lastTemp - currentTemp;
 
-  // if temp is increasing quickly
-  if (dTemp < -1.8 && brewing) {
-    lastBrewEndTime = now;
-    brewing = false;
+  switch (currentState) {
+    case maintain:
+      if (dTemp > .45 && currentTemp < targetTemp) {
+        currentState = brewStarted;
+        stateBegan = now;
+      }
+      break;
+    case brewStarted:
+      if (now - stateBegan > 2000) {
+        currentState = brewMain;
+        stateBegan = now;
+      }
+      break;
+    case brewMain:
+      // if 30s elapsed
+      if (stateBegan + 30000 < now) {
+        currentState = brewRecovery;
+        stateBegan = now;
+      }
+      break;
+    case brewRecovery:
+      if (stateBegan + 60000 < now) {
+        currentState = maintain;
+        stateBegan = now;
+      }
+      break;
   }
 
   float pTerm = KP * err;
@@ -137,26 +168,28 @@ float duty(float currentTemp, long now) {
   if (errSum < -5) errSum = -5;
 
   float duty = pTerm + iTerm + dTerm;
-  if (brewing && (currentTemp < targetTemp + 2)) duty = (dTemp > 0) ? 1.0 : .9;
+  // when brewing, go full power as temp falls
+  if (currentState == brewStarted) duty = 1.0;
   // keep at least a little power in to soften the descent.
-  if ((currentTemp > targetTemp) && (dTemp > 0)) duty = max(duty, min(-.015*err, .05));
+  float maxFallingPower = (currentState == brewMain) ? .3 : .05;
+  if ((currentTemp > targetTemp) && (dTemp > 0)) {
+    if (currentState == brewMain) {
+      duty = max(duty, .5);
+    } else {
+      duty = max(duty, min(-.015*err, maxFallingPower));
+    }
+  }
   if (duty < 0) duty = 0;
   if (duty > 1) duty = 1;
-
-  // if temp is falling quickly and it's been at least 90s since the last
-  // brew cycle ended...
-  // waiting 90s helps us tolerate wide oscillation just after brewing stops.
-  if ((currentTemp < targetTemp) && (dTemp > .35) && (lastBrewEndTime == 0 || now > lastBrewEndTime + 90000)) {
-    brewing = true;
-    duty = 1.0;
-  }
 
   printCSV(lastTemp);
   printCSV(currentTemp);
   printCSV(pTerm);
   printCSV(iTerm);
   printCSV(dTerm);
-  Serial.println(duty);
+  Serial.print(duty);
+  Serial.print(",");
+  Serial.println(currentState);
 
   lastTemp = currentTemp;
 
