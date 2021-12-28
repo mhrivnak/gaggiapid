@@ -17,6 +17,8 @@ const byte timer1OutputB = 10;
 const int FREQ = 900;
 const unsigned long countTo = ((float) F_CPU / 1024.0) / (1000.0 / FREQ);
 
+const int buttonPin = 2;
+
 // initialize the library with the numbers of the interface pins
 LiquidCrystal lcd(7, 8, 9, 11, 12, 13);
 
@@ -34,14 +36,14 @@ const double KDfall = 0.5;
 const double KDrise = 0.1;
 float currentDuty;
 unsigned long stateBegan = 0;
+float brewTime = 0;
 
 enum state {
   maintain,
-  brewStarted,
-  brewMain,
-  brewRecovery
+  brewing,
 };
 state currentState = maintain;
+char errMessage[16] = "";
 
 void setup() {
   Serial.begin(9600);
@@ -60,43 +62,63 @@ void setup() {
   bitSet (TCCR1A, COM1B1);   // clear OC1B on compare
   OCR1B = 0; // initial setting is off
   
+  pinMode(buttonPin, INPUT);
 }
 
 void loop() {
   uint16_t rtd = thermo.readRTD();
   float ratio = float(rtd) / 32768;
   float res = ratio * RREF;
+  float temp = 0;
 
   uint8_t fault = thermo.readFault();
   if (fault) {
-    lcd.setCursor(0, 0);
-    lcd.print("Fault 0x"); lcd.print(fault, HEX);
-    lcd.setCursor(0, 1);
     if (fault & MAX31865_FAULT_HIGHTHRESH) {
-      lcd.print("RTD High"); 
+      strcpy(errMessage, "RTD High");
     }
     if (fault & MAX31865_FAULT_LOWTHRESH) {
-      lcd.print("RTD Low"); 
+      strcpy(errMessage, "RTD Low"); 
     }
     if (fault & MAX31865_FAULT_REFINLOW) {
-      lcd.print("REFIN- >0.85xBias"); 
+      strcpy(errMessage, "REFIN- >0.85"); 
     }
     if (fault & MAX31865_FAULT_REFINHIGH) {
-      lcd.print("REFIN- <0.85xBias"); 
+      strcpy(errMessage, "REFIN- <0.85"); 
     }
     if (fault & MAX31865_FAULT_RTDINLOW) {
-      lcd.print("RTDIN- <0.85xBias"); 
+      strcpy(errMessage, "RTDIN- <0.85"); 
     }
     if (fault & MAX31865_FAULT_OVUV) {
-      lcd.print("Under/Over V"); 
+      strcpy(errMessage, "Under/Over V"); 
     }
     thermo.clearFault();
+    handleError();
     return;
   }
 
-  float temp = thermo.temperature(RNOMINAL, RREF);
+  temp = thermo.temperature(RNOMINAL, RREF);
+
+  if (temp < 0) {
+    strcpy(errMessage, "Temp < 0");
+    handleError();
+    return;
+  }
 
   unsigned long now = millis();
+
+  // set current state
+  if (now - stateBegan > 200) {
+    int buttonState = digitalRead(buttonPin);
+    if (buttonState == HIGH) {
+      currentState = currentState == maintain ? brewing : maintain;
+      stateBegan = now;
+    }
+  }
+
+  if (currentState == brewing) {
+    brewTime = float(now - stateBegan) / 1000.;
+  }
+
   if (now >= nextCycleTime) {
     currentDuty = duty(temp, now);
     float limit = countTo * currentDuty - 1;
@@ -110,12 +132,24 @@ void loop() {
   lcd.print("T: ");
   lcd.print(temp);
   lcd.print(" C  ");
+  if (brewTime < 10) {
+    lcd.print(" ");
+  }
+  lcd.print(String(brewTime, 1));
 
   lcd.setCursor(0, 1);
   lcd.print("D: ");
   lcd.print(currentDuty);
-  lcd.print("  S: ");
-  lcd.print(currentState);
+  lcd.print(currentState == maintain ? "    maint" : "     brew");
+}
+
+void handleError() {
+  OCR1B = 0; // heater off
+  lcd.setCursor(0, 0);
+  lcd.print("Error");
+  lcd.setCursor(0, 1);
+  lcd.print(errMessage);
+  return;
 }
 
 float duty(float currentTemp, long now) {
@@ -127,34 +161,6 @@ float duty(float currentTemp, long now) {
 
   double err = targetTemp - currentTemp;
   double dTemp = lastTemp - currentTemp;
-
-  switch (currentState) {
-    case maintain:
-      if (dTemp > .45 && currentTemp < targetTemp) {
-        currentState = brewStarted;
-        stateBegan = now;
-      }
-      break;
-    case brewStarted:
-      if (now - stateBegan > 2000) {
-        currentState = brewMain;
-        stateBegan = now;
-      }
-      break;
-    case brewMain:
-      // if 30s elapsed
-      if (stateBegan + 30000 < now) {
-        currentState = brewRecovery;
-        stateBegan = now;
-      }
-      break;
-    case brewRecovery:
-      if (stateBegan + 60000 < now) {
-        currentState = maintain;
-        stateBegan = now;
-      }
-      break;
-  }
 
   float pTerm = KP * err;
   float iTerm = KI * errSum;
@@ -168,12 +174,12 @@ float duty(float currentTemp, long now) {
   if (errSum < -5) errSum = -5;
 
   float duty = pTerm + iTerm + dTerm;
-  // when brewing, go full power as temp falls
-  if (currentState == brewStarted) duty = 1.0;
+  // when brewing, go full power for 2s
+  if (currentState == brewing & now - stateBegan < 2000) duty = 1.0;
   // keep at least a little power in to soften the descent.
-  float maxFallingPower = (currentState == brewMain) ? .3 : .05;
+  float maxFallingPower = (currentState == brewing) ? .3 : .05;
   if ((currentTemp > targetTemp) && (dTemp > 0)) {
-    if (currentState == brewMain) {
+    if (currentState == brewing) {
       duty = max(duty, .5);
     } else {
       duty = max(duty, min(-.015*err, maxFallingPower));
